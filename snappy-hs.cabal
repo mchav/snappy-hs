@@ -3,6 +3,7 @@ name:               snappy-hs
 version:            0.1.0.0
 -- synopsis:
 -- description:
+homepage:           https://github.com/mchav/snappy-hs#readme
 license:            MIT
 license-file:       LICENSE
 author:             Michael Chavinda
