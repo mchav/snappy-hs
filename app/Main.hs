@@ -3,7 +3,13 @@ module Main (main) where
 
 import Snappy (decompress)
 
+import qualified Data.ByteString as BS
+
 main :: IO ()
 main = do
-  let s = decompress "hello"
-  print s
+  src <- BS.readFile "./data/Isaac.Newton-Opticks.txt.rawsnappy"
+  raw <- BS.readFile "./data/Isaac.Newton-Opticks.txt"
+  case decompress src of
+    Left e -> print e
+    Right decompressed -> do
+      print (decompressed == raw)

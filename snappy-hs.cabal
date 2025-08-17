@@ -22,6 +22,7 @@ library
 
     build-depends:    base >=4.11 && <5
                     , bytestring ^>= 0.12
+                    , vector ^>= 0.13
     hs-source-dirs:   src
     default-language: Haskell2010
 
@@ -30,6 +31,7 @@ executable snappy-hs
     main-is:          Main.hs
     build-depends:
         base >=4.11 && <5,
+        bytestring ^>= 0.12,
         snappy-hs
 
     hs-source-dirs:   app
@@ -46,3 +48,14 @@ test-suite snappy-hs-test
     build-depends:
         base >=4.11 && <5,
         snappy-hs
+
+benchmark snappy-benchmark
+    type:       exitcode-stdio-1.0
+    main-is:    Main.hs
+    hs-source-dirs: benchmark
+    build-depends: base >= 4.17.2.0 && < 4.22,
+                   criterion >= 1 && <= 1.6.4.0,
+                   bytestring ^>= 0.12,
+                   snappy ^>= 0.2,
+                   snappy-hs
+    default-language: Haskell2010
