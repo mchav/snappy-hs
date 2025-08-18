@@ -2,7 +2,8 @@
 {-# LANGUAGE Strict       #-}
 module Snappy (
     compress,
-    decompress
+    decompress,
+    DecodeError(..)
 ) where
 
 import           Control.Exception (Exception)
@@ -14,7 +15,7 @@ import qualified Data.ByteString.Lazy as LBS
 import           Data.Word
 import qualified Data.Vector.Unboxed.Mutable as VUM
 
-decompress :: BS.ByteString -> Either ParseException BS.ByteString
+decompress :: BS.ByteString -> Either DecodeError BS.ByteString
 decompress s = do
     (_, bytesRead) <- decodedLength s
     let payload = BS.drop bytesRead s
@@ -23,21 +24,21 @@ decompress s = do
 maxVarintLen64 :: Int
 maxVarintLen64 = 10
 
-data ParseException = EmptyInput
+data DecodeError = EmptyInput
                     | Overflow
                     | VarIntTooLong 
                     | UnexpectedEOF
                     | UnsupportedLiteralLength
                     | InvalidOffset
                     | InvalidTag deriving (Show, Eq)
-instance Exception ParseException
+instance Exception DecodeError
 
-decodedLength :: BS.ByteString -> Either ParseException (Int, Int)
+decodedLength :: BS.ByteString -> Either DecodeError (Int, Int)
 decodedLength src = do
     (value, bytesRead) <- decodeVarInt src
     pure (fromIntegral value, bytesRead)
   where
-    decodeVarInt :: BS.ByteString -> Either ParseException (Word64, Int)
+    decodeVarInt :: BS.ByteString -> Either DecodeError (Word64, Int)
     decodeVarInt bs
         | BS.null bs = Left EmptyInput
         | otherwise = go 0 0 0 bs
@@ -56,10 +57,10 @@ decodedLength src = do
                            (bytesRead + 1)
                            rest
 
-decode :: BS.ByteString -> Either ParseException BS.ByteString
+decode :: BS.ByteString -> Either DecodeError BS.ByteString
 decode = go mempty BS.empty
   where
-    go :: Builder.Builder -> BS.ByteString -> BS.ByteString -> Either ParseException BS.ByteString
+    go :: Builder.Builder -> BS.ByteString -> BS.ByteString -> Either DecodeError BS.ByteString
     go !acc !out bs
       | BS.null bs = Right (toStrict acc)
       | otherwise  = case BS.uncons bs of
@@ -115,15 +116,15 @@ decode = go mempty BS.empty
 toStrict :: Builder.Builder -> BS.ByteString
 toStrict = LBS.toStrict . Builder.toLazyByteString
 
-take1 :: BS.ByteString -> Either ParseException (Word8, BS.ByteString)
+take1 :: BS.ByteString -> Either DecodeError (Word8, BS.ByteString)
 take1 bs = maybe (Left UnexpectedEOF) Right (BS.uncons bs)
 
-takeN :: Int -> BS.ByteString -> Either ParseException (BS.ByteString, BS.ByteString)
+takeN :: Int -> BS.ByteString -> Either DecodeError (BS.ByteString, BS.ByteString)
 takeN n bs
     | BS.length bs < n = Left UnexpectedEOF
     | otherwise        = Right (BS.take n bs, BS.drop n bs)
 
-readLE :: Int -> BS.ByteString -> Either ParseException (Int, BS.ByteString)
+readLE :: Int -> BS.ByteString -> Either DecodeError (Int, BS.ByteString)
 readLE n bs = do
     (bytes, rest) <- takeN n bs
     let val = leBytesToInt bytes
@@ -133,11 +134,11 @@ leBytesToInt :: BS.ByteString -> Int
 leBytesToInt =
     snd . BS.foldl' (\(!i, !acc) b -> (i+8, acc .|. (fromIntegral b .<<. i))) (0, 0)
 
-whenBad :: Bool -> ParseException -> Either ParseException ()
+whenBad :: Bool -> DecodeError -> Either DecodeError ()
 whenBad True  e = Left e
 whenBad False _ = Right ()
 
-makeCopy :: BS.ByteString -> Int -> Int -> Either ParseException BS.ByteString
+makeCopy :: BS.ByteString -> Int -> Int -> Either DecodeError BS.ByteString
 makeCopy out offset len = do
     whenBad (offset <= 0) InvalidOffset
     let outLen = BS.length out
