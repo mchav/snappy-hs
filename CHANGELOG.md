@@ -1,5 +1,9 @@
 # Revision history for snappy-hs
 
-## 0.1.0.0 -- YYYY-mm-dd
+## 0.1.0.1 -- 2025-08-17
 
-* First version. Released on an unsuspecting world.
+* Loosen version bounds for bytestring and vector.
+
+## 0.1.0.0 -- 2025-08-16
+
+* Compress and decompress raw snappy
