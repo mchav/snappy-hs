@@ -1,17 +1,21 @@
 cabal-version:      3.0
 name:               snappy-hs
-version:            0.1.0.2
+version:            0.1.0.3
 synopsis:           Snappy compression library.
 description:        A pure Haskell implementation of the Snappy compression spec.
 license:            MIT
 license-file:       LICENSE
 author:             Michael Chavinda
 maintainer:         mschavinda@gmail.com
--- copyright:
+homepage:           https://github.com/mchav/snappy-hs
+bug-reports:        https://github.com/mchav/snappy-hs/issues
 category:           Codec
 build-type:         Simple
-extra-doc-files:    CHANGELOG.md
--- extra-source-files:
+extra-doc-files:    CHANGELOG.md, README.md
+
+source-repository head
+  type:     git
+  location: https://github.com/mchav/snappy-hs
 
 common warnings
     ghc-options: -Wall
