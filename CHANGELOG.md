@@ -1,5 +1,10 @@
 # Revision history for snappy-hs
 
+
+## 0.1.0.5 -- 2026-02-23
+
+* Use `Ptr` directly to make implementation faster.
+
 ## 0.1.0.4 -- 2025-10-7
 
 * Loosen vector and bytestring bounds.
