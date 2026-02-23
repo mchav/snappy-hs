@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
+
 {-# LANGUAGE Strict #-}
 
 module Snappy (
@@ -8,22 +10,15 @@ module Snappy (
 ) where
 
 import Control.Exception (Exception)
-import Control.Monad.ST (ST, runST)
-import Data.Bits ((.&.), (.<<.), (.>>.), (.|.))
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder as Builder
-import qualified Data.ByteString.Lazy as LBS
-import qualified Data.Vector.Unboxed.Mutable as VUM
+import Data.Bits
+import Data.ByteString.Internal (ByteString (..))
 import Data.Word
-
-decompress :: BS.ByteString -> Either DecodeError BS.ByteString
-decompress s = do
-    (_, bytesRead) <- decodedLength s
-    let payload = BS.drop bytesRead s
-    decode payload
-
-maxVarintLen64 :: Int
-maxVarintLen64 = 10
+import Foreign.ForeignPtr
+import Foreign.Marshal.Alloc (callocBytes, free)
+import Foreign.Marshal.Utils (copyBytes, fillBytes)
+import Foreign.Ptr
+import Foreign.Storable
+import System.IO.Unsafe (unsafeDupablePerformIO)
 
 data DecodeError
     = EmptyInput
@@ -34,260 +29,335 @@ data DecodeError
     | InvalidOffset
     | InvalidTag
     deriving (Show, Eq)
+
 instance Exception DecodeError
 
-decodedLength :: BS.ByteString -> Either DecodeError (Int, Int)
-decodedLength src = do
-    (value, bytesRead) <- decodeVarInt src
-    pure (fromIntegral value, bytesRead)
+decompress :: ByteString -> Either DecodeError ByteString
+decompress (BS srcFp srcLen)
+    | srcLen == 0 = Left EmptyInput
+    | otherwise = unsafeDupablePerformIO $
+        withForeignPtr srcFp $ \srcPtr -> do
+            let srcEnd = srcPtr `plusPtr` srcLen
+            vr <- parseVarint srcPtr srcEnd
+            case vr of
+                Left e -> pure (Left e)
+                Right (outLen, hdrLen) -> do
+                    let payPtr = srcPtr `plusPtr` hdrLen
+                    outFp <- mallocForeignPtrBytes (max 1 outLen)
+                    withForeignPtr outFp $ \outPtr -> do
+                        r <- decodeLoop payPtr srcEnd outPtr 0 outLen
+                        case r of
+                            Left e -> pure (Left e)
+                            Right _ -> pure (Right (BS outFp outLen))
+
+{-# INLINE parseVarint #-}
+parseVarint :: Ptr Word8 -> Ptr Word8 -> IO (Either DecodeError (Int, Int))
+parseVarint !ptr !end = go 0 0 0
   where
-    decodeVarInt :: BS.ByteString -> Either DecodeError (Word64, Int)
-    decodeVarInt bs
-        | BS.null bs = Left EmptyInput
-        | otherwise = go 0 0 0 bs
-      where
-        go acc shift bytesRead bytes
-            | bytesRead > maxVarintLen64 = Left VarIntTooLong
-            | shift > 63 = Left Overflow
-            | otherwise = case BS.uncons bytes of
-                Nothing -> Left UnexpectedEOF
-                Just (b, rest)
-                    | b < 0x80 ->
-                        Right (acc .|. (fromIntegral b .<<. shift), bytesRead + 1)
-                    | otherwise ->
-                        go
-                            (acc .|. ((fromIntegral b .&. 0x7f) .<<. shift))
-                            (shift + 7)
-                            (bytesRead + 1)
-                            rest
-
-decode :: BS.ByteString -> Either DecodeError BS.ByteString
-decode = go mempty BS.empty
-  where
-    go :: Builder.Builder -> BS.ByteString -> BS.ByteString -> Either DecodeError BS.ByteString
-    go !acc !out bs
-        | BS.null bs = Right (toStrict acc)
-        | otherwise = case BS.uncons bs of
-            Nothing -> Left UnexpectedEOF
-            Just (tag, rest) ->
-                case tag .&. 0x03 of
-                    0 -> do
-                        let hdr = fromIntegral (tag .>>. 2) :: Int
-                        if hdr < 60
-                            then do
-                                let len = hdr + 1
-                                (lit, rest') <- takeN len rest
-                                let acc' = acc <> Builder.byteString lit
-                                    out' = out <> lit
-                                go acc' out' rest'
-                            else do
-                                let nbytes = hdr - 59
-                                whenBad (nbytes < 1 || nbytes > 4) UnsupportedLiteralLength
-                                (lenMinus1, rest1) <- readLE nbytes rest
-                                let len = lenMinus1 + 1
-                                (lit, rest') <- takeN len rest1
-                                let acc' = acc <> Builder.byteString lit
-                                    out' = out <> lit
-                                go acc' out' rest'
-                    1 -> do
-                        (lo, rest1) <- take1 rest
-                        let len = (fromIntegral ((tag .>>. 2) .&. 0x07) :: Int) + 4
-                            offHi = fromIntegral (tag .>>. 5) :: Int
-                            offset = (offHi .<<. 8) .|. fromIntegral lo
-                        chunk <- makeCopy out offset len
-                        let acc' = acc <> Builder.byteString chunk
-                            out' = out <> chunk
-                        go acc' out' rest1
-                    2 -> do
-                        (off, rest1) <- readLE 2 rest
-                        let len = (fromIntegral ((tag .>>. 2) .&. 0x3f) :: Int) + 1
-                        chunk <- makeCopy out off len
-                        let acc' = acc <> Builder.byteString chunk
-                            out' = out <> chunk
-                        go acc' out' rest1
-                    3 -> do
-                        (off, rest1) <- readLE 4 rest
-                        let len = (fromIntegral ((tag .>>. 2) .&. 0x3f) :: Int) + 1
-                        chunk <- makeCopy out off len
-                        let acc' = acc <> Builder.byteString chunk
-                            out' = out <> chunk
-                        go acc' out' rest1
-                    _ -> Left InvalidTag
-
-toStrict :: Builder.Builder -> BS.ByteString
-toStrict = LBS.toStrict . Builder.toLazyByteString
-
-take1 :: BS.ByteString -> Either DecodeError (Word8, BS.ByteString)
-take1 bs = maybe (Left UnexpectedEOF) Right (BS.uncons bs)
-
-takeN :: Int -> BS.ByteString -> Either DecodeError (BS.ByteString, BS.ByteString)
-takeN n bs
-    | BS.length bs < n = Left UnexpectedEOF
-    | otherwise = Right (BS.take n bs, BS.drop n bs)
-
-readLE :: Int -> BS.ByteString -> Either DecodeError (Int, BS.ByteString)
-readLE n bs = do
-    (bytes, rest) <- takeN n bs
-    let val = leBytesToInt bytes
-    pure (val, rest)
-
-leBytesToInt :: BS.ByteString -> Int
-leBytesToInt =
-    snd . BS.foldl' (\(!i, !acc) b -> (i + 8, acc .|. (fromIntegral b .<<. i))) (0, 0)
-
-whenBad :: Bool -> DecodeError -> Either DecodeError ()
-whenBad True e = Left e
-whenBad False _ = Right ()
-
-makeCopy :: BS.ByteString -> Int -> Int -> Either DecodeError BS.ByteString
-makeCopy out offset len = do
-    whenBad (offset <= 0) InvalidOffset
-    let outLen = BS.length out
-    whenBad (offset > outLen) InvalidOffset
-    let start = outLen - offset
-        pattern = BS.take offset (BS.drop start out)
-    pure $ repeatToLen pattern len
-
-repeatToLen :: BS.ByteString -> Int -> BS.ByteString
-repeatToLen pat n =
-    let plen = BS.length pat
-        times = n `div` plen
-        remain = n `mod` plen
-        bld =
-            mconcat (replicate times (Builder.byteString pat))
-                <> Builder.byteString (BS.take remain pat)
-     in LBS.toStrict (Builder.toLazyByteString bld)
-
-compress :: BS.ByteString -> BS.ByteString
-compress src =
-    let header = Builder.toLazyByteString (putVarint (fromIntegral (BS.length src)))
-        payload = Builder.toLazyByteString (encodePayload src)
-     in LBS.toStrict (header <> payload)
-
-encodePayload :: BS.ByteString -> Builder.Builder
-encodePayload bs
-    | n < 4 = emitLiteral bs 0 n
-    | otherwise = runST $ do
-        let tableSize = 1 .<<. 15
-        tbl <- VUM.replicate tableSize (-1 :: Int)
-        loop tbl 0 0 mempty
-  where
-    n = BS.length bs
-
-    loop :: VUM.MVector s Int -> Int -> Int -> Builder.Builder -> ST s Builder.Builder
-    loop tbl !i !litStart !acc
-        | i + 3 >= n = pure (acc <> emitLiteral bs litStart (n - litStart))
+    go :: Word64 -> Int -> Int -> IO (Either DecodeError (Int, Int))
+    go !acc !s !n
+        | n > 10 = pure (Left VarIntTooLong)
+        | s > 63 = pure (Left Overflow)
+        | ptr `plusPtr` n >= end = pure (Left UnexpectedEOF)
         | otherwise = do
-            let !w = readU32LE bs i
-                !h = hash32 w
-            prev <- VUM.read tbl h
-            VUM.write tbl h i
-            case prev of
-                (-1) -> loop tbl (i + 1) litStart acc
-                p -> do
-                    let off = i - p
-                    if off <= 0 || p + 3 >= n
-                        then loop tbl (i + 1) litStart acc
-                        else
-                            if readU32LE bs p == w
-                                then do
-                                    let m0 = 4 + extendMatch bs (i + 4) (p + 4) n
-                                        acc' =
-                                            if i > litStart
-                                                then acc <> emitLiteral bs litStart (i - litStart)
-                                                else acc
-                                        acc'' = acc' <> emitCopies off m0
-                                        i' = i + m0
-                                    loop tbl i' i' acc''
-                                else loop tbl (i + 1) litStart acc
+            b <- peekByteOff ptr n :: IO Word8
+            if b < 0x80
+                then pure (Right (fromIntegral (acc .|. (fromIntegral b `unsafeShiftL` s)), n + 1))
+                else
+                    go
+                        (acc .|. ((fromIntegral b .&. 0x7f) `unsafeShiftL` s))
+                        (s + 7)
+                        (n + 1)
 
-extendMatch :: BS.ByteString -> Int -> Int -> Int -> Int
-extendMatch bs = go
+decodeLoop :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Int -> Int -> IO (Either DecodeError Int)
+decodeLoop !src0 !srcEnd !dst = go src0
   where
-    go !a !b !n
-        | a < n && b < n && BS.index bs a == BS.index bs b = 1 + go (a + 1) (b + 1) n
-        | otherwise = 0
+    go :: Ptr Word8 -> Int -> Int -> IO (Either DecodeError Int)
+    go !src !di !outLen
+        | src >= srcEnd = pure (Right di)
+        | otherwise = do
+            tag <- peek src :: IO Word8
+            let src' = src `plusPtr` 1
+            case tag .&. 0x03 of
+                0 -> do
+                    let hdr = fromIntegral (tag `unsafeShiftR` 2) :: Int
+                    if hdr < 60
+                        then do
+                            let litLen = hdr + 1
+                            if src' `plusPtr` litLen > srcEnd || di + litLen > outLen
+                                then pure (Left UnexpectedEOF)
+                                else do
+                                    copyBytes (dst `plusPtr` di) src' litLen
+                                    go (src' `plusPtr` litLen) (di + litLen) outLen
+                        else do
+                            let nb = hdr - 59
+                            if nb < 1 || nb > 4
+                                then pure (Left UnsupportedLiteralLength)
+                                else
+                                    if src' `plusPtr` nb > srcEnd
+                                        then pure (Left UnexpectedEOF)
+                                        else do
+                                            lm1 <- readLEn src' nb
+                                            let litLen = lm1 + 1
+                                                src'' = src' `plusPtr` nb
+                                            if src'' `plusPtr` litLen > srcEnd || di + litLen > outLen
+                                                then pure (Left UnexpectedEOF)
+                                                else do
+                                                    copyBytes (dst `plusPtr` di) src'' litLen
+                                                    go (src'' `plusPtr` litLen) (di + litLen) outLen
+                1 -> do
+                    if src' >= srcEnd
+                        then pure (Left UnexpectedEOF)
+                        else do
+                            lo <- peek src' :: IO Word8
+                            let cpLen = (fromIntegral ((tag `unsafeShiftR` 2) .&. 0x07) :: Int) + 4
+                                offHi = fromIntegral (tag `unsafeShiftR` 5) :: Int
+                                offset = (offHi `unsafeShiftL` 8) .|. fromIntegral lo
+                            if offset <= 0 || offset > di
+                                then pure (Left InvalidOffset)
+                                else do
+                                    copyOverlap dst di offset cpLen
+                                    go (src' `plusPtr` 1) (di + cpLen) outLen
+                2 -> do
+                    if src' `plusPtr` 2 > srcEnd
+                        then pure (Left UnexpectedEOF)
+                        else do
+                            off <- readLEn src' 2
+                            let cpLen = (fromIntegral ((tag `unsafeShiftR` 2) .&. 0x3f) :: Int) + 1
+                            if off <= 0 || off > di
+                                then pure (Left InvalidOffset)
+                                else do
+                                    copyOverlap dst di off cpLen
+                                    go (src' `plusPtr` 2) (di + cpLen) outLen
+                3 -> do
+                    if src' `plusPtr` 4 > srcEnd
+                        then pure (Left UnexpectedEOF)
+                        else do
+                            off <- readLEn src' 4
+                            let cpLen = (fromIntegral ((tag `unsafeShiftR` 2) .&. 0x3f) :: Int) + 1
+                            if off <= 0 || off > di
+                                then pure (Left InvalidOffset)
+                                else do
+                                    copyOverlap dst di off cpLen
+                                    go (src' `plusPtr` 4) (di + cpLen) outLen
+                _ -> pure (Left InvalidTag)
 
+compress :: ByteString -> ByteString
+compress (BS srcFp srcLen) = unsafeDupablePerformIO $
+    withForeignPtr srcFp $ \srcPtr -> do
+        -- Worst-case expansion: varint header (≤10 B) + per-literal overhead
+        let maxOut = 10 + srcLen + (srcLen `div` 6) + 64
+        outFp <- mallocForeignPtrBytes maxOut
+        withForeignPtr outFp $ \outPtr -> do
+            hdrLen <- writeVarint outPtr (fromIntegral srcLen :: Word64)
+            written <-
+                if srcLen < 4
+                    then writeLiteral srcPtr 0 srcLen outPtr hdrLen
+                    else do
+                        let !tableSize = 1 `unsafeShiftL` 15
+                            !tableBytes = tableSize * sizeOfInt
+                        tbl <- callocBytes tableBytes :: IO (Ptr Int)
+                        w <- compressLoop srcPtr srcLen tbl outPtr hdrLen 0 0
+                        free tbl
+                        pure w
+            pure (BS outFp written)
+
+sizeOfInt :: Int
+sizeOfInt = sizeOf (0 :: Int)
+{-# INLINE sizeOfInt #-}
+
+compressLoop :: Ptr Word8 -> Int -> Ptr Int -> Ptr Word8 -> Int -> Int -> Int -> IO Int
+compressLoop !src !srcLen !tbl !dst !dstOff0 = go dstOff0
+  where
+    go :: Int -> Int -> Int -> IO Int
+    go !dstOff !i !litStart
+        | i + 3 >= srcLen = do
+            let remLen = srcLen - litStart
+            if remLen > 0
+                then writeLiteral src litStart remLen dst dstOff
+                else pure dstOff
+        | otherwise = do
+            w <- readU32LE src i
+            let !h = hash32 w
+            prev0 <- peekByteOff tbl (h * sizeOfInt) :: IO Int
+            pokeByteOff tbl (h * sizeOfInt) (i + 1 :: Int)
+            let prev = prev0 - 1
+            if prev < 0
+                then go dstOff (i + 1) litStart
+                else do
+                    pw <- readU32LE src prev
+                    if pw /= w
+                        then go dstOff (i + 1) litStart
+                        else do
+                            dstOff' <-
+                                if i > litStart
+                                    then writeLiteral src litStart (i - litStart) dst dstOff
+                                    else pure dstOff
+                            extra <- extendMatchIO src (i + 4) (prev + 4) srcLen
+                            let matchLen = 4 + extra
+                                offset = i - prev
+                            dstOff'' <- writeCopies offset matchLen dst dstOff'
+                            let i' = i + matchLen
+                            go dstOff'' i' i'
+
+extendMatchIO :: Ptr Word8 -> Int -> Int -> Int -> IO Int
+extendMatchIO !ptr !a0 !b0 !limit = go 0
+  where
+    go !n
+        | a0 + n >= limit || b0 + n >= limit = pure n
+        | otherwise = do
+            ba <- peekByteOff ptr (a0 + n) :: IO Word8
+            bb <- peekByteOff ptr (b0 + n) :: IO Word8
+            if ba == bb then go (n + 1) else pure n
+{-# INLINE extendMatchIO #-}
+
+-- --------------------------------------------------------------------------
+-- Helpers – reading
+-- --------------------------------------------------------------------------
+
+{-# INLINE readLEn #-}
+readLEn :: Ptr Word8 -> Int -> IO Int
+readLEn !ptr = \case
+    1 -> do
+        b0 <- peek ptr :: IO Word8
+        pure (fromIntegral b0)
+    2 -> do
+        b0 <- peek ptr :: IO Word8
+        b1 <- peekByteOff ptr 1 :: IO Word8
+        pure (fromIntegral b0 .|. (fromIntegral b1 `unsafeShiftL` 8))
+    3 -> do
+        b0 <- peek ptr :: IO Word8
+        b1 <- peekByteOff ptr 1 :: IO Word8
+        b2 <- peekByteOff ptr 2 :: IO Word8
+        pure
+            ( fromIntegral b0
+                .|. (fromIntegral b1 `unsafeShiftL` 8)
+                .|. (fromIntegral b2 `unsafeShiftL` 16)
+            )
+    4 -> do
+        b0 <- peek ptr :: IO Word8
+        b1 <- peekByteOff ptr 1 :: IO Word8
+        b2 <- peekByteOff ptr 2 :: IO Word8
+        b3 <- peekByteOff ptr 3 :: IO Word8
+        pure
+            ( fromIntegral b0
+                .|. (fromIntegral b1 `unsafeShiftL` 8)
+                .|. (fromIntegral b2 `unsafeShiftL` 16)
+                .|. (fromIntegral b3 `unsafeShiftL` 24)
+            )
+    n -> go 0 0 n -- fallback
+  where
+    go !acc !_ 0 = pure acc
+    go !acc !k m = do
+        b <- peekByteOff ptr k :: IO Word8
+        go (acc .|. (fromIntegral b `unsafeShiftL` (k * 8))) (k + 1) (m - 1)
+
+{-# INLINE readU32LE #-}
+readU32LE :: Ptr Word8 -> Int -> IO Word32
+readU32LE !ptr !i = do
+    b0 <- peekByteOff ptr i :: IO Word8
+    b1 <- peekByteOff ptr (i + 1) :: IO Word8
+    b2 <- peekByteOff ptr (i + 2) :: IO Word8
+    b3 <- peekByteOff ptr (i + 3) :: IO Word8
+    pure $!
+        fromIntegral b0
+            .|. (fromIntegral b1 `unsafeShiftL` 8)
+            .|. (fromIntegral b2 `unsafeShiftL` 16)
+            .|. (fromIntegral b3 `unsafeShiftL` 24)
+
+{-# INLINE hash32 #-}
 hash32 :: Word32 -> Int
-hash32 w =
-    let kMul :: Word32
-        kMul = 0x1e35a7bd
-        bucketBits = 15
-     in fromIntegral ((w * kMul) .>>. (32 - bucketBits))
+hash32 !w =
+    let !kMul = 0x1e35a7bd :: Word32
+     in fromIntegral ((w * kMul) `unsafeShiftR` (32 - 15))
 
-readU32LE :: BS.ByteString -> Int -> Word32
-readU32LE s i =
-    let b0 = fromIntegral (BS.index s i) :: Word32
-        b1 = fromIntegral (BS.index s (i + 1)) :: Word32
-        b2 = fromIntegral (BS.index s (i + 2)) :: Word32
-        b3 = fromIntegral (BS.index s (i + 3)) :: Word32
-     in b0 .|. (b1 .<<. 8) .|. (b2 .<<. 16) .|. (b3 .<<. 24)
-
-putVarint :: Word64 -> Builder.Builder
-putVarint x0 = go x0
+{-# INLINE writeVarint #-}
+writeVarint :: Ptr Word8 -> Word64 -> IO Int
+writeVarint !ptr = go 0
   where
-    go !x
-        | x < 0x80 = Builder.word8 (fromIntegral x)
-        | otherwise =
-            Builder.word8 (fromIntegral (0x80 .|. (x .&. 0x7f)))
-                <> go (x .>>. 7)
+    go !off !x
+        | x < 0x80 = do
+            pokeByteOff ptr off (fromIntegral x :: Word8)
+            pure (off + 1)
+        | otherwise = do
+            pokeByteOff ptr off (fromIntegral (0x80 .|. (x .&. 0x7f)) :: Word8)
+            go (off + 1) (x `unsafeShiftR` 7)
 
-emitLiteral :: BS.ByteString -> Int -> Int -> Builder.Builder
-emitLiteral _ _ 0 = mempty
-emitLiteral bs off len
-    | len <= 60 =
-        let tag = fromIntegral (((len - 1) .<<. 2) .|. 0x00) :: Word8
-         in Builder.word8 tag <> Builder.byteString (bsSlice bs off len)
-    | otherwise =
+writeLiteral :: Ptr Word8 -> Int -> Int -> Ptr Word8 -> Int -> IO Int
+writeLiteral _ _ 0 _ !dstOff = pure dstOff
+writeLiteral !src !off !len !dst !dstOff
+    | len <= 60 = do
+        let !tag = fromIntegral (((len - 1) `unsafeShiftL` 2) .|. 0x00) :: Word8
+        pokeByteOff dst dstOff tag
+        copyBytes (dst `plusPtr` (dstOff + 1)) (src `plusPtr` off) len
+        pure (dstOff + 1 + len)
+    | otherwise = do
         let l1 = len - 1
-            nbytes = bytesFor l1
-            tag = fromIntegral (((59 + nbytes) .<<. 2) .|. 0x00) :: Word8
-         in Builder.word8 tag
-                <> putLE nbytes (fromIntegral l1 :: Word32)
-                <> Builder.byteString (bsSlice bs off len)
+            nb = bytesFor l1
+            !tag = fromIntegral (((59 + nb) `unsafeShiftL` 2) .|. 0x00) :: Word8
+        pokeByteOff dst dstOff tag
+        writeLEn dst (dstOff + 1) nb (fromIntegral l1 :: Word32)
+        copyBytes (dst `plusPtr` (dstOff + 1 + nb)) (src `plusPtr` off) len
+        pure (dstOff + 1 + nb + len)
 
-emitCopies :: Int -> Int -> Builder.Builder
-emitCopies !offset !len
-    | len <= 0 = mempty
-    | otherwise =
-        let (chunk, rest) =
-                if offset <= 0x7FF && len >= 4
-                    then
-                        let c = min 11 len
-                         in (emitCopy1 c offset, len - c)
-                    else
-                        if offset <= 0xFFFF
-                            then
-                                let c = min 64 len
-                                 in (emitCopy2 c offset, len - c)
-                            else
-                                let c = min 64 len
-                                 in (emitCopy4 c offset, len - c)
-         in chunk <> emitCopies offset rest
+writeCopies :: Int -> Int -> Ptr Word8 -> Int -> IO Int
+writeCopies !offset = go
+  where
+    go :: Int -> Ptr Word8 -> Int -> IO Int
+    go !remLen !dst !dstOff
+        | remLen <= 0 = pure dstOff
+        | offset <= 0x7FF && remLen >= 4 = do
+            let c = min 11 remLen
+            dstOff' <- writeCopy1 c offset dst dstOff
+            go (remLen - c) dst dstOff'
+        | offset <= 0xFFFF = do
+            let c = min 64 remLen
+            dstOff' <- writeCopy2 c offset dst dstOff
+            go (remLen - c) dst dstOff'
+        | otherwise = do
+            let c = min 64 remLen
+            dstOff' <- writeCopy4 c offset dst dstOff
+            go (remLen - c) dst dstOff'
+{-# INLINE writeCopies #-}
 
-emitCopy1 :: Int -> Int -> Builder.Builder
-emitCopy1 len off =
-    let lenField = (len - 4) .&. 0x7
-        offHi = (off .>>. 8) .&. 0x7
-        tag = fromIntegral ((lenField .<<. 2) .|. (offHi .<<. 5) .|. 0x01) :: Word8
-        lo = fromIntegral (off .&. 0xFF) :: Word8
-     in Builder.word8 tag <> Builder.word8 lo
+{-# INLINE writeCopy1 #-}
+writeCopy1 :: Int -> Int -> Ptr Word8 -> Int -> IO Int
+writeCopy1 !len !off !dst !dstOff = do
+    let !lenField = (len - 4) .&. 0x7
+        !offHi = (off `unsafeShiftR` 8) .&. 0x7
+        !tag = fromIntegral ((lenField `unsafeShiftL` 2) .|. (offHi `unsafeShiftL` 5) .|. 0x01) :: Word8
+        !lo = fromIntegral (off .&. 0xFF) :: Word8
+    pokeByteOff dst dstOff tag
+    pokeByteOff dst (dstOff + 1) lo
+    pure (dstOff + 2)
 
-emitCopy2 :: Int -> Int -> Builder.Builder
-emitCopy2 len off =
-    let tag = fromIntegral (((len - 1) .<<. 2) .|. 0x02) :: Word8
-     in Builder.word8 tag
-            <> putLE 2 (fromIntegral off :: Word32)
+{-# INLINE writeCopy2 #-}
+writeCopy2 :: Int -> Int -> Ptr Word8 -> Int -> IO Int
+writeCopy2 !len !off !dst !dstOff = do
+    let !tag = fromIntegral (((len - 1) `unsafeShiftL` 2) .|. 0x02) :: Word8
+    pokeByteOff dst dstOff tag
+    writeLEn dst (dstOff + 1) 2 (fromIntegral off :: Word32)
+    pure (dstOff + 3)
 
-emitCopy4 :: Int -> Int -> Builder.Builder
-emitCopy4 len off =
-    let tag = fromIntegral (((len - 1) .<<. 2) .|. 0x03) :: Word8
-     in Builder.word8 tag
-            <> putLE 4 (fromIntegral off :: Word32)
+{-# INLINE writeCopy4 #-}
+writeCopy4 :: Int -> Int -> Ptr Word8 -> Int -> IO Int
+writeCopy4 !len !off !dst !dstOff = do
+    let !tag = fromIntegral (((len - 1) `unsafeShiftL` 2) .|. 0x03) :: Word8
+    pokeByteOff dst dstOff tag
+    writeLEn dst (dstOff + 1) 4 (fromIntegral off :: Word32)
+    pure (dstOff + 5)
 
-putLE :: Int -> Word32 -> Builder.Builder
-putLE n v = mconcat [Builder.word8 (fromIntegral ((v .>>. (8 * k)) .&. 0xFF)) | k <- [0 .. n - 1]]
+{-# INLINE writeLEn #-}
+writeLEn :: Ptr Word8 -> Int -> Int -> Word32 -> IO ()
+writeLEn !dst !off !n !v = go 0
+  where
+    go !k
+        | k >= n = pure ()
+        | otherwise = do
+            pokeByteOff dst (off + k) (fromIntegral ((v `unsafeShiftR` (8 * k)) .&. 0xFF) :: Word8)
+            go (k + 1)
 
+{-# INLINE bytesFor #-}
 bytesFor :: Int -> Int
 bytesFor x
     | x < 0x100 = 1
@@ -295,5 +365,19 @@ bytesFor x
     | x < 0x1000000 = 3
     | otherwise = 4
 
-bsSlice :: BS.ByteString -> Int -> Int -> BS.ByteString
-bsSlice s off len = BS.take len (BS.drop off s)
+{-# INLINE copyOverlap #-}
+copyOverlap :: Ptr Word8 -> Int -> Int -> Int -> IO ()
+copyOverlap !base !outOff !offset !len
+    | offset >= len = copyBytes (base `plusPtr` outOff) (base `plusPtr` srcStart) len
+    | offset == 1 = do
+        b <- peekByteOff base srcStart :: IO Word8
+        fillBytes (base `plusPtr` outOff) b len
+    | otherwise = go 0
+  where
+    !srcStart = outOff - offset
+    go !i
+        | i >= len = pure ()
+        | otherwise = do
+            b <- peekByteOff base (srcStart + (i `rem` offset)) :: IO Word8
+            pokeByteOff base (outOff + i) b
+            go (i + 1)
