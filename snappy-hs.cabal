@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               snappy-hs
-version:            0.1.0.5
+version:            0.1.1.0
 synopsis:           Snappy compression library.
 description:        A pure Haskell implementation of the Snappy compression spec.
 license:            MIT
@@ -50,7 +50,20 @@ test-suite snappy-hs-test
     main-is:          Main.hs
     build-depends:
         base >=4.11 && <5,
+        bytestring >= 0.11 && < 0.14,
         snappy-hs
+
+executable snappy-bench
+    import:           warnings
+    main-is:          Bench.hs
+    hs-source-dirs:   benchmark
+    build-depends:
+        base >=4.11 && <5,
+        bytestring >= 0.11 && < 0.14,
+        time,
+        snappy-hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
 
 -- benchmark snappy-benchmark
 --     type:       exitcode-stdio-1.0
