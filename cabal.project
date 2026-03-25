@@ -1,0 +1,9 @@
+packages: .
+
+package snappy
+  extra-lib-dirs:
+      /opt/homebrew/opt/snappy/lib
+      /usr/local/opt/snappy/lib
+  extra-include-dirs:
+      /opt/homebrew/opt/snappy/include
+      /usr/local/opt/snappy/include
