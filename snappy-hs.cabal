@@ -60,7 +60,7 @@ executable snappy-bench
     build-depends:
         base >=4.11 && <5,
         bytestring >= 0.11 && < 0.14,
-        time >= 1.14 && < 1.15,
+        time >= 1.15 && < 1.16,
         snappy-hs >= 0.1 && < 1
     default-language: Haskell2010
     ghc-options:      -rtsopts
@@ -70,7 +70,7 @@ benchmark snappy-benchmark
     main-is:    Main.hs
     hs-source-dirs: benchmark
     build-depends: base >= 4.11 && < 5,
-                   criterion >= 1 && <= 1.6.4.0,
+                   criterion >= 1 && <= 1.6.6.0,
                    bytestring >= 0.11 && < 0.14,
                    snappy ^>= 0.2,
                    snappy-hs
